@@ -12,6 +12,9 @@ PVE Backup Web 是一个面向 Linux / Proxmox VE 的轻量级 Web 备份面板�
 - 实时任务进度显示，包含上传字节数、速度、任务阶段和错误信息。
 - 可取消、重试、删除任务，并手动刷新或标记云端完成状态。
 - 管理后台包含用户管理、目录权限、群晖连接配置、公告、日志、HTTPS 证书和登录风控。
+- 管理员可在后台修改网页监听端口和公开访问地址，端口变更在重启服务后生效。
+- 支持 SMTP 邮件通知，可为任务到达群晖、Cloud Sync 完成、任务失败和登录封禁发送邮件。
+- 用户可在账户页绑定通知邮箱，管理员还可接收站点管理日志类通知。
 - 登录失败达到阈值后启用验证码，并可配置临时或永久封禁策略。
 - 状态存储使用 SQLite，敏感配置会使用本机 `app.key` 加密后保存。
 
@@ -90,6 +93,18 @@ https://服务器IP:60000
   "synology_staging_dir": "/NVME/.pve-backup-incoming",
   "synology_cloud_target_dir": "/NVME/PVEBackup",
   "verify_tls": false,
+  "smtp_enabled": false,
+  "smtp_host": "",
+  "smtp_port": 587,
+  "smtp_secure": "starttls",
+  "smtp_username": "",
+  "smtp_password": "",
+  "smtp_from_email": "",
+  "smtp_from_name": "PVE Backup Web",
+  "mail_event_job_nas_done": true,
+  "mail_event_job_cloud_done": true,
+  "mail_event_job_failed": true,
+  "mail_event_login_ban": true,
   "captcha_after_failures": 2,
   "max_login_failures": 10,
   "ban_duration_minutes": 0,
@@ -105,9 +120,28 @@ https://服务器IP:60000
 - `synology_staging_dir`：上传暂存目录，程序会先上传到这里。
 - `synology_cloud_target_dir`：最终移入的 Cloud Sync 同步目录。
 - `verify_tls`：连接群晖时是否校验 TLS 证书；自签证书环境可设为 `false`。
+- `smtp_enabled`：是否启用 SMTP 发信。
+- `smtp_host` / `smtp_port`：SMTP 服务器和端口，默认端口 `587`。
+- `smtp_secure`：SMTP 加密方式，可选 `starttls`、`tls`、`plain`。
+- `smtp_username` / `smtp_password`：SMTP 登录账号和密码或授权码。
+- `smtp_from_email` / `smtp_from_name`：邮件发件地址和发件名称。
+- `mail_event_*`：控制不同事件是否触发邮件通知。
 - `ban_duration_minutes` 为 `0` 且 `permanent_ban` 为 `true` 时，达到失败阈值后永久封禁。
 
 群晖账号需要具备 File Station 上传、建目录、移动文件，以及读取 Cloud Sync 状态的权限。
+
+## 邮件通知
+
+管理员可在后台的“邮件发送”区域配置 SMTP，并发送测试邮件验证配置。用户可在“账户 > 邮箱通知”中绑定邮箱并选择是否接收文件传输日志。
+
+当前支持的通知事件：
+
+- 文件上传到群晖暂存目录并移动到目标目录后。
+- Cloud Sync 判断云端同步完成后。
+- 备份任务失败后。
+- 登录失败达到封禁阈值后通知管理员。
+
+SMTP 密码会和群晖密码一样加密保存在 SQLite 中，不会明文写回 `config.json`。
 
 ## systemd 部署
 

@@ -28,9 +28,12 @@ import (
 	"io/fs"
 	"log"
 	"math/big"
+	"mime"
 	"mime/multipart"
 	"net"
 	"net/http"
+	"net/mail"
+	"net/smtp"
 	"net/textproto"
 	"net/url"
 	"os"
@@ -47,11 +50,15 @@ import (
 )
 
 const (
-	appName              = "PVE Backup Web"
-	defaultAddr          = ":60000"
-	sessionCookie        = "pve_backup_session"
-	defaultCaptchaAfter  = 2
-	defaultMaxLoginFails = 10
+	appName               = "PVE Backup Web"
+	defaultAddr           = ":60000"
+	sessionCookie         = "pve_backup_session"
+	defaultCaptchaAfter   = 2
+	defaultMaxLoginFails  = 10
+	mailEventJobNASDone   = "job_nas_done"
+	mailEventJobCloudDone = "job_cloud_done"
+	mailEventJobFailed    = "job_failed"
+	mailEventLoginBan     = "login_ban"
 )
 
 var (
@@ -91,6 +98,18 @@ type Config struct {
 	SynologyStagingDir     string `json:"synology_staging_dir"`
 	SynologyCloudTargetDir string `json:"synology_cloud_target_dir"`
 	VerifyTLS              bool   `json:"verify_tls"`
+	SMTPEnabled            bool   `json:"smtp_enabled"`
+	SMTPHost               string `json:"smtp_host"`
+	SMTPPort               int    `json:"smtp_port"`
+	SMTPSecure             string `json:"smtp_secure"`
+	SMTPUsername           string `json:"smtp_username"`
+	SMTPPassword           string `json:"smtp_password"`
+	SMTPFromEmail          string `json:"smtp_from_email"`
+	SMTPFromName           string `json:"smtp_from_name"`
+	MailEventJobNASDone    bool   `json:"mail_event_job_nas_done"`
+	MailEventJobCloudDone  bool   `json:"mail_event_job_cloud_done"`
+	MailEventJobFailed     bool   `json:"mail_event_job_failed"`
+	MailEventLoginBan      bool   `json:"mail_event_login_ban"`
 	CaptchaAfterFailures   int    `json:"captcha_after_failures"`
 	MaxLoginFailures       int    `json:"max_login_failures"`
 	BanDurationMinutes     int    `json:"ban_duration_minutes"`
@@ -112,14 +131,17 @@ type State struct {
 }
 
 type User struct {
-	ID           int64   `json:"id"`
-	Username     string  `json:"username"`
-	Salt         string  `json:"salt"`
-	PasswordHash string  `json:"password_hash"`
-	IsAdmin      bool    `json:"is_admin"`
-	AllowedRoots []int64 `json:"allowed_roots"`
-	UploadDir    string  `json:"upload_dir"`
-	CreatedAt    string  `json:"created_at"`
+	ID              int64    `json:"id"`
+	Username        string   `json:"username"`
+	Salt            string   `json:"salt"`
+	PasswordHash    string   `json:"password_hash"`
+	IsAdmin         bool     `json:"is_admin"`
+	AllowedRoots    []int64  `json:"allowed_roots"`
+	UploadDir       string   `json:"upload_dir"`
+	Emails          []string `json:"emails"`
+	NotifyJobDone   bool     `json:"notify_job_done"`
+	NotifyAdminLogs bool     `json:"notify_admin_logs"`
+	CreatedAt       string   `json:"created_at"`
 }
 
 type Root struct {
@@ -130,28 +152,29 @@ type Root struct {
 }
 
 type Job struct {
-	ID             int64  `json:"id"`
-	UserID         int64  `json:"user_id"`
-	RootID         int64  `json:"root_id"`
-	SourceRelPath  string `json:"source_rel_path"`
-	SourceAbsPath  string `json:"source_abs_path"`
-	SourceIsDir    bool   `json:"source_is_dir"`
-	SourceSize     int64  `json:"source_size"`
-	SourceMtime    string `json:"source_mtime"`
-	Stage          string `json:"stage"`
-	TransferBytes  int64  `json:"transfer_bytes"`
-	TransferTotal  int64  `json:"transfer_total"`
-	TransferSpeed  int64  `json:"transfer_speed"`
-	CloudBytes     int64  `json:"cloud_bytes"`
-	CloudTotal     int64  `json:"cloud_total"`
-	CloudSpeed     int64  `json:"cloud_speed"`
-	NASPath        string `json:"nas_path"`
-	StagingPath    string `json:"staging_path"`
-	Error          string `json:"error"`
-	CreatedAt      string `json:"created_at"`
-	StartedAt      string `json:"started_at"`
-	CompletedAt    string `json:"completed_at"`
-	CloudUpdatedAt string `json:"cloud_updated_at"`
+	ID             int64    `json:"id"`
+	UserID         int64    `json:"user_id"`
+	RootID         int64    `json:"root_id"`
+	SourceRelPath  string   `json:"source_rel_path"`
+	SourceAbsPath  string   `json:"source_abs_path"`
+	SourceIsDir    bool     `json:"source_is_dir"`
+	SourceSize     int64    `json:"source_size"`
+	SourceMtime    string   `json:"source_mtime"`
+	Stage          string   `json:"stage"`
+	TransferBytes  int64    `json:"transfer_bytes"`
+	TransferTotal  int64    `json:"transfer_total"`
+	TransferSpeed  int64    `json:"transfer_speed"`
+	CloudBytes     int64    `json:"cloud_bytes"`
+	CloudTotal     int64    `json:"cloud_total"`
+	CloudSpeed     int64    `json:"cloud_speed"`
+	NASPath        string   `json:"nas_path"`
+	StagingPath    string   `json:"staging_path"`
+	Error          string   `json:"error"`
+	CreatedAt      string   `json:"created_at"`
+	StartedAt      string   `json:"started_at"`
+	CompletedAt    string   `json:"completed_at"`
+	CloudUpdatedAt string   `json:"cloud_updated_at"`
+	NotifiedEvents []string `json:"notified_events"`
 }
 
 type AuditLog struct {
@@ -293,6 +316,13 @@ func loadConfig() (Config, error) {
 		SynologyStagingDir:     "/NVME/.pve-backup-incoming",
 		SynologyCloudTargetDir: "/NVME/百度云测试/PVEBackup",
 		VerifyTLS:              false,
+		SMTPPort:               587,
+		SMTPSecure:             "starttls",
+		SMTPFromName:           appName,
+		MailEventJobNASDone:    true,
+		MailEventJobCloudDone:  true,
+		MailEventJobFailed:     true,
+		MailEventLoginBan:      true,
 		CaptchaAfterFailures:   defaultCaptchaAfter,
 		MaxLoginFailures:       defaultMaxLoginFails,
 		BanDurationMinutes:     0,
@@ -349,6 +379,11 @@ func normalizeConfig(cfg *Config) {
 	if cfg.ListenAddr == "" {
 		cfg.ListenAddr = defaultAddr
 	}
+	if listen, _, err := normalizeListenAddr(cfg.ListenAddr); err == nil {
+		cfg.ListenAddr = listen
+	} else {
+		cfg.ListenAddr = defaultAddr
+	}
 	if cfg.PublicBaseURL == "" {
 		cfg.PublicBaseURL = "https://202.189.4.217:60000"
 	}
@@ -372,12 +407,28 @@ func normalizeConfig(cfg *Config) {
 	if cfg.BanDurationMinutes < 0 {
 		cfg.BanDurationMinutes = 0
 	}
+	cfg.SMTPHost = strings.TrimSpace(cfg.SMTPHost)
+	cfg.SMTPUsername = strings.TrimSpace(cfg.SMTPUsername)
+	cfg.SMTPFromEmail = strings.TrimSpace(cfg.SMTPFromEmail)
+	cfg.SMTPFromName = strings.TrimSpace(cfg.SMTPFromName)
+	if cfg.SMTPPort == 0 {
+		cfg.SMTPPort = 587
+	}
+	if cfg.SMTPPort < 0 || cfg.SMTPPort > 65535 {
+		cfg.SMTPPort = 587
+	}
+	cfg.SMTPSecure = normalizeSMTPSecure(cfg.SMTPSecure)
+	if cfg.SMTPFromName == "" {
+		cfg.SMTPFromName = appName
+	}
 }
 
 func writeConfigFile(cfg Config) error {
 	cfg.SynologyBaseURL = ""
 	cfg.SynologyUsername = ""
 	cfg.SynologyPassword = ""
+	cfg.SMTPUsername = ""
+	cfg.SMTPPassword = ""
 	return writeJSON(configPath, cfg, 0600)
 }
 
@@ -430,6 +481,9 @@ func openStateDB() (*sql.DB, error) {
 			is_admin INTEGER NOT NULL,
 			allowed_roots TEXT NOT NULL,
 			upload_dir TEXT NOT NULL DEFAULT '',
+			emails TEXT NOT NULL DEFAULT '[]',
+			notify_job_done INTEGER NOT NULL DEFAULT 0,
+			notify_admin_logs INTEGER NOT NULL DEFAULT 0,
 			created_at TEXT NOT NULL
 		)`,
 		`CREATE TABLE IF NOT EXISTS roots (
@@ -460,7 +514,8 @@ func openStateDB() (*sql.DB, error) {
 			created_at TEXT NOT NULL,
 			started_at TEXT NOT NULL,
 			completed_at TEXT NOT NULL,
-			cloud_updated_at TEXT NOT NULL
+			cloud_updated_at TEXT NOT NULL,
+			notified_events TEXT NOT NULL DEFAULT '[]'
 		)`,
 		`CREATE TABLE IF NOT EXISTS audit (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -511,8 +566,12 @@ func openStateDB() (*sql.DB, error) {
 	}
 	for _, stmt := range []string{
 		`ALTER TABLE users ADD COLUMN upload_dir TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE users ADD COLUMN emails TEXT NOT NULL DEFAULT '[]'`,
+		`ALTER TABLE users ADD COLUMN notify_job_done INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE users ADD COLUMN notify_admin_logs INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE jobs ADD COLUMN source_is_dir INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE jobs ADD COLUMN transfer_total INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE jobs ADD COLUMN notified_events TEXT NOT NULL DEFAULT '[]'`,
 		`ALTER TABLE audit ADD COLUMN ip TEXT NOT NULL DEFAULT ''`,
 	} {
 		if _, err := db.Exec(stmt); err != nil && !strings.Contains(strings.ToLower(err.Error()), "duplicate column") {
@@ -604,6 +663,12 @@ func normalizeState(st *State) {
 			st.NextUserID = u.ID + 1
 		}
 	}
+	for i := range st.Users {
+		st.Users[i].Emails = normalizeEmailList(st.Users[i].Emails)
+		if !st.Users[i].IsAdmin {
+			st.Users[i].NotifyAdminLogs = false
+		}
+	}
 	for _, r := range st.Roots {
 		if r.ID >= st.NextRootID {
 			st.NextRootID = r.ID + 1
@@ -640,7 +705,7 @@ func (a *App) saveLocked() error {
 
 func readStateDB(db *sql.DB) (State, error) {
 	st := State{}
-	rows, err := db.Query(`SELECT id, username, salt, password_hash, is_admin, allowed_roots, upload_dir, created_at FROM users ORDER BY id`)
+	rows, err := db.Query(`SELECT id, username, salt, password_hash, is_admin, allowed_roots, upload_dir, emails, notify_job_done, notify_admin_logs, created_at FROM users ORDER BY id`)
 	if err != nil {
 		return st, err
 	}
@@ -648,12 +713,19 @@ func readStateDB(db *sql.DB) (State, error) {
 		var u User
 		var isAdmin int
 		var allowed string
-		if err := rows.Scan(&u.ID, &u.Username, &u.Salt, &u.PasswordHash, &isAdmin, &allowed, &u.UploadDir, &u.CreatedAt); err != nil {
+		var emails string
+		var notifyJobDone int
+		var notifyAdminLogs int
+		if err := rows.Scan(&u.ID, &u.Username, &u.Salt, &u.PasswordHash, &isAdmin, &allowed, &u.UploadDir, &emails, &notifyJobDone, &notifyAdminLogs, &u.CreatedAt); err != nil {
 			rows.Close()
 			return st, err
 		}
 		u.IsAdmin = isAdmin != 0
 		_ = json.Unmarshal([]byte(allowed), &u.AllowedRoots)
+		_ = json.Unmarshal([]byte(emails), &u.Emails)
+		u.Emails = normalizeEmailList(u.Emails)
+		u.NotifyJobDone = notifyJobDone != 0
+		u.NotifyAdminLogs = notifyAdminLogs != 0 && u.IsAdmin
 		st.Users = append(st.Users, u)
 	}
 	if err := rows.Close(); err != nil {
@@ -676,18 +748,20 @@ func readStateDB(db *sql.DB) (State, error) {
 		return st, err
 	}
 
-	rows, err = db.Query(`SELECT id, user_id, root_id, source_rel_path, source_abs_path, source_is_dir, source_size, source_mtime, stage, transfer_bytes, transfer_total, transfer_speed, cloud_bytes, cloud_total, cloud_speed, nas_path, staging_path, error, created_at, started_at, completed_at, cloud_updated_at FROM jobs ORDER BY id`)
+	rows, err = db.Query(`SELECT id, user_id, root_id, source_rel_path, source_abs_path, source_is_dir, source_size, source_mtime, stage, transfer_bytes, transfer_total, transfer_speed, cloud_bytes, cloud_total, cloud_speed, nas_path, staging_path, error, created_at, started_at, completed_at, cloud_updated_at, notified_events FROM jobs ORDER BY id`)
 	if err != nil {
 		return st, err
 	}
 	for rows.Next() {
 		var j Job
 		var sourceIsDir int
-		if err := rows.Scan(&j.ID, &j.UserID, &j.RootID, &j.SourceRelPath, &j.SourceAbsPath, &sourceIsDir, &j.SourceSize, &j.SourceMtime, &j.Stage, &j.TransferBytes, &j.TransferTotal, &j.TransferSpeed, &j.CloudBytes, &j.CloudTotal, &j.CloudSpeed, &j.NASPath, &j.StagingPath, &j.Error, &j.CreatedAt, &j.StartedAt, &j.CompletedAt, &j.CloudUpdatedAt); err != nil {
+		var notified string
+		if err := rows.Scan(&j.ID, &j.UserID, &j.RootID, &j.SourceRelPath, &j.SourceAbsPath, &sourceIsDir, &j.SourceSize, &j.SourceMtime, &j.Stage, &j.TransferBytes, &j.TransferTotal, &j.TransferSpeed, &j.CloudBytes, &j.CloudTotal, &j.CloudSpeed, &j.NASPath, &j.StagingPath, &j.Error, &j.CreatedAt, &j.StartedAt, &j.CompletedAt, &j.CloudUpdatedAt, &notified); err != nil {
 			rows.Close()
 			return st, err
 		}
 		j.SourceIsDir = sourceIsDir != 0
+		_ = json.Unmarshal([]byte(notified), &j.NotifiedEvents)
 		st.Jobs = append(st.Jobs, j)
 	}
 	if err := rows.Close(); err != nil {
@@ -778,8 +852,9 @@ func writeStateDB(db *sql.DB, st State) error {
 	}
 	for _, u := range st.Users {
 		allowed, _ := json.Marshal(u.AllowedRoots)
-		if _, err := tx.Exec(`INSERT INTO users(id, username, salt, password_hash, is_admin, allowed_roots, upload_dir, created_at) VALUES(?, ?, ?, ?, ?, ?, ?, ?)`,
-			u.ID, u.Username, u.Salt, u.PasswordHash, boolInt(u.IsAdmin), string(allowed), u.UploadDir, u.CreatedAt); err != nil {
+		emails, _ := json.Marshal(normalizeEmailList(u.Emails))
+		if _, err := tx.Exec(`INSERT INTO users(id, username, salt, password_hash, is_admin, allowed_roots, upload_dir, emails, notify_job_done, notify_admin_logs, created_at) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			u.ID, u.Username, u.Salt, u.PasswordHash, boolInt(u.IsAdmin), string(allowed), u.UploadDir, string(emails), boolInt(u.NotifyJobDone), boolInt(u.NotifyAdminLogs && u.IsAdmin), u.CreatedAt); err != nil {
 			return err
 		}
 	}
@@ -789,8 +864,9 @@ func writeStateDB(db *sql.DB, st State) error {
 		}
 	}
 	for _, j := range st.Jobs {
-		if _, err := tx.Exec(`INSERT INTO jobs(id, user_id, root_id, source_rel_path, source_abs_path, source_is_dir, source_size, source_mtime, stage, transfer_bytes, transfer_total, transfer_speed, cloud_bytes, cloud_total, cloud_speed, nas_path, staging_path, error, created_at, started_at, completed_at, cloud_updated_at) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-			j.ID, j.UserID, j.RootID, j.SourceRelPath, j.SourceAbsPath, boolInt(j.SourceIsDir), j.SourceSize, j.SourceMtime, j.Stage, j.TransferBytes, j.TransferTotal, j.TransferSpeed, j.CloudBytes, j.CloudTotal, j.CloudSpeed, j.NASPath, j.StagingPath, j.Error, j.CreatedAt, j.StartedAt, j.CompletedAt, j.CloudUpdatedAt); err != nil {
+		notified, _ := json.Marshal(j.NotifiedEvents)
+		if _, err := tx.Exec(`INSERT INTO jobs(id, user_id, root_id, source_rel_path, source_abs_path, source_is_dir, source_size, source_mtime, stage, transfer_bytes, transfer_total, transfer_speed, cloud_bytes, cloud_total, cloud_speed, nas_path, staging_path, error, created_at, started_at, completed_at, cloud_updated_at, notified_events) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			j.ID, j.UserID, j.RootID, j.SourceRelPath, j.SourceAbsPath, boolInt(j.SourceIsDir), j.SourceSize, j.SourceMtime, j.Stage, j.TransferBytes, j.TransferTotal, j.TransferSpeed, j.CloudBytes, j.CloudTotal, j.CloudSpeed, j.NASPath, j.StagingPath, j.Error, j.CreatedAt, j.StartedAt, j.CompletedAt, j.CloudUpdatedAt, string(notified)); err != nil {
 			return err
 		}
 	}
@@ -844,6 +920,8 @@ func (a *App) loadSecureConfig() error {
 		"synology_base_url": &a.config.SynologyBaseURL,
 		"synology_username": &a.config.SynologyUsername,
 		"synology_password": &a.config.SynologyPassword,
+		"smtp_username":     &a.config.SMTPUsername,
+		"smtp_password":     &a.config.SMTPPassword,
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -876,6 +954,8 @@ func (a *App) saveConfigLocked() error {
 		"synology_base_url": a.config.SynologyBaseURL,
 		"synology_username": a.config.SynologyUsername,
 		"synology_password": a.config.SynologyPassword,
+		"smtp_username":     a.config.SMTPUsername,
+		"smtp_password":     a.config.SMTPPassword,
 	} {
 		if err := a.writeSecureStringLocked(key, value); err != nil {
 			return err
@@ -989,6 +1069,7 @@ func (a *App) routes(mux *http.ServeMux) {
 	mux.HandleFunc("/logout", a.handleLogout)
 	mux.HandleFunc("/api/me", a.auth(a.handleMe))
 	mux.HandleFunc("/api/change-password", a.auth(a.handleChangePassword))
+	mux.HandleFunc("/api/account/notifications", a.auth(a.handleAccountNotifications))
 	mux.HandleFunc("/api/announcement", a.auth(a.handleAnnouncement))
 	mux.HandleFunc("/api/events", a.auth(a.handleEvents))
 	mux.HandleFunc("/api/roots", a.auth(a.handleRoots))
@@ -1002,7 +1083,10 @@ func (a *App) routes(mux *http.ServeMux) {
 	mux.HandleFunc("/api/admin/user-upload-dir", a.auth(a.admin(a.handleAdminUserUploadDir)))
 	mux.HandleFunc("/api/admin/roots", a.auth(a.admin(a.handleAdminRoots)))
 	mux.HandleFunc("/api/admin/root-delete", a.auth(a.admin(a.handleAdminRootDelete)))
+	mux.HandleFunc("/api/admin/site", a.auth(a.admin(a.handleAdminSite)))
 	mux.HandleFunc("/api/admin/synology", a.auth(a.admin(a.handleAdminSynology)))
+	mux.HandleFunc("/api/admin/mail", a.auth(a.admin(a.handleAdminMail)))
+	mux.HandleFunc("/api/admin/mail/test", a.auth(a.admin(a.handleAdminMailTest)))
 	mux.HandleFunc("/api/admin/announcement", a.auth(a.admin(a.handleAdminAnnouncement)))
 	mux.HandleFunc("/api/admin/logs", a.auth(a.admin(a.handleAdminLogs)))
 	mux.HandleFunc("/api/admin/logs/clear", a.auth(a.admin(a.handleAdminClearLogs)))
@@ -1159,6 +1243,7 @@ func (a *App) handleLogin(w http.ResponseWriter, r *http.Request) {
 	log.Printf("[auth] login failed username=%q ip=%s failures=%d banned=%t", req.Username, ip, count, banned)
 	if banned {
 		log.Printf("[security] created login ban username=%q ip=%s ban_id=%d permanent=%t until=%s", req.Username, ip, ban.ID, ban.Permanent, ban.Until)
+		go a.notifyLoginBan(ban)
 		jsonErrorWith(w, http.StatusForbidden, "too many failed attempts; login is banned", banPayload(ban))
 		return
 	}
@@ -1235,6 +1320,53 @@ func (a *App) handleChangePassword(w http.ResponseWriter, r *http.Request, u Use
 	jsonError(w, http.StatusNotFound, "user not found")
 }
 
+func (a *App) handleAccountNotifications(w http.ResponseWriter, r *http.Request, u User) {
+	switch r.Method {
+	case http.MethodGet:
+		a.mu.Lock()
+		defer a.mu.Unlock()
+		for _, current := range a.state.Users {
+			if current.ID == u.ID {
+				writeJSONResponse(w, map[string]interface{}{"user": publicUser(current)})
+				return
+			}
+		}
+		jsonError(w, http.StatusNotFound, "user not found")
+	case http.MethodPost:
+		var req struct {
+			Emails          []string `json:"emails"`
+			NotifyJobDone   bool     `json:"notify_job_done"`
+			NotifyAdminLogs bool     `json:"notify_admin_logs"`
+		}
+		if err := readJSON(r, &req); err != nil {
+			jsonError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		emails, err := validateEmailList(req.Emails)
+		if err != nil {
+			jsonError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		a.mu.Lock()
+		defer a.mu.Unlock()
+		for i := range a.state.Users {
+			if a.state.Users[i].ID == u.ID {
+				a.state.Users[i].Emails = emails
+				a.state.Users[i].NotifyJobDone = req.NotifyJobDone
+				a.state.Users[i].NotifyAdminLogs = req.NotifyAdminLogs && a.state.Users[i].IsAdmin
+				a.auditWithIPLocked(u.ID, "update_email_settings", fmt.Sprintf("emails=%d job_done=%t admin_logs=%t", len(emails), a.state.Users[i].NotifyJobDone, a.state.Users[i].NotifyAdminLogs), clientIP(r))
+				_ = a.saveLocked()
+				log.Printf("[account] email settings updated user=%q emails=%d job_done=%t admin_logs=%t ip=%s", a.state.Users[i].Username, len(emails), a.state.Users[i].NotifyJobDone, a.state.Users[i].NotifyAdminLogs, clientIP(r))
+				writeJSONResponse(w, map[string]interface{}{"success": true, "user": publicUser(a.state.Users[i])})
+				return
+			}
+		}
+		jsonError(w, http.StatusNotFound, "user not found")
+	default:
+		jsonError(w, http.StatusMethodNotAllowed, "method not allowed")
+	}
+}
+
 func (a *App) handleAnnouncement(w http.ResponseWriter, r *http.Request, u User) {
 	if r.Method != http.MethodGet {
 		jsonError(w, http.StatusMethodNotAllowed, "method not allowed")
@@ -1270,7 +1402,11 @@ func (a *App) handleEvents(w http.ResponseWriter, r *http.Request, u User) {
 	for {
 		select {
 		case ev := <-ch:
-			b, _ := json.Marshal(ev.Data)
+			data, ok := a.eventDataForUser(ev, u)
+			if !ok {
+				continue
+			}
+			b, _ := json.Marshal(data)
 			fmt.Fprintf(w, "event: %s\ndata: %s\n\n", ev.Type, b)
 			flusher.Flush()
 		case <-t.C:
@@ -1292,7 +1428,7 @@ func (a *App) handleRoots(w http.ResponseWriter, r *http.Request, u User) {
 	var roots []Root
 	for _, root := range a.state.Roots {
 		if u.IsAdmin || containsID(u.AllowedRoots, root.ID) {
-			roots = append(roots, root)
+			roots = append(roots, publicRoot(root, u))
 		}
 	}
 	writeJSONResponse(w, map[string]interface{}{"roots": roots})
@@ -1346,7 +1482,7 @@ func (a *App) handleFiles(w http.ResponseWriter, r *http.Request, u User) {
 		}
 		return strings.ToLower(items[i].Name) < strings.ToLower(items[j].Name)
 	})
-	writeJSONResponse(w, map[string]interface{}{"items": items, "path": cleanRel(rel), "root": root})
+	writeJSONResponse(w, map[string]interface{}{"items": items, "path": cleanRel(rel), "root": publicRoot(root, u)})
 }
 
 func (a *App) handleJobs(w http.ResponseWriter, r *http.Request, u User) {
@@ -1354,13 +1490,17 @@ func (a *App) handleJobs(w http.ResponseWriter, r *http.Request, u User) {
 	case http.MethodGet:
 		a.mu.Lock()
 		defer a.mu.Unlock()
-		jobs := []Job{}
+		rows := []Job{}
 		for _, j := range a.state.Jobs {
 			if u.IsAdmin || j.UserID == u.ID {
-				jobs = append(jobs, j)
+				rows = append(rows, j)
 			}
 		}
-		sort.Slice(jobs, func(i, j int) bool { return jobs[i].ID > jobs[j].ID })
+		sort.Slice(rows, func(i, j int) bool { return rows[i].ID > rows[j].ID })
+		jobs := make([]map[string]interface{}, 0, len(rows))
+		for _, j := range rows {
+			jobs = append(jobs, a.publicJobLocked(j, u))
+		}
 		writeJSONResponse(w, map[string]interface{}{"jobs": jobs})
 	case http.MethodPost:
 		var req struct {
@@ -1426,11 +1566,12 @@ func (a *App) handleJobs(w http.ResponseWriter, r *http.Request, u User) {
 		a.appendJobEventLocked(job, "创建任务")
 		a.auditLocked(u.ID, "create_job", fmt.Sprintf("%s -> %s", full, job.NASPath))
 		_ = a.saveLocked()
+		responseJob := a.publicJobLocked(job, u)
 		a.mu.Unlock()
 		log.Printf("[job] created id=%d user=%q root=%s rel=%s dir=%t size=%d nas=%s", job.ID, u.Username, root.Path, rel, sourceIsDir, sourceSize, job.NASPath)
 		a.jobQueue <- jobID
 		a.broadcast("job", job)
-		writeJSONResponse(w, map[string]interface{}{"job": job})
+		writeJSONResponse(w, map[string]interface{}{"job": responseJob})
 	default:
 		jsonError(w, http.StatusMethodNotAllowed, "method not allowed")
 	}
@@ -1526,6 +1667,7 @@ func (a *App) handleJobAction(w http.ResponseWriter, r *http.Request, u User) {
 		job.StartedAt = ""
 		job.CompletedAt = ""
 		job.CloudUpdatedAt = ""
+		job.NotifiedEvents = nil
 		a.state.Jobs[idx] = job
 		updated = job
 		enqueue = true
@@ -1569,6 +1711,7 @@ func (a *App) handleJobAction(w http.ResponseWriter, r *http.Request, u User) {
 		a.appendJobEventLocked(updated, jobActionMessage(req.Action))
 	}
 	_ = a.saveLocked()
+	responseJob := a.publicJobLocked(updated, u)
 	a.mu.Unlock()
 
 	if enqueue {
@@ -1579,8 +1722,11 @@ func (a *App) handleJobAction(w http.ResponseWriter, r *http.Request, u User) {
 		writeJSONResponse(w, map[string]interface{}{"success": true, "deleted": req.JobID})
 		return
 	}
+	if req.Action == "mark_cloud_completed" && updated.Stage == "CloudCompleted" {
+		go a.notifyJobMail(updated.ID, mailEventJobCloudDone)
+	}
 	a.broadcast("job", updated)
-	writeJSONResponse(w, map[string]interface{}{"success": true, "job": updated})
+	writeJSONResponse(w, map[string]interface{}{"success": true, "job": responseJob})
 }
 
 func (a *App) handleAdminUsers(w http.ResponseWriter, r *http.Request, admin User) {
@@ -1855,6 +2001,63 @@ func (a *App) handleAdminRootDelete(w http.ResponseWriter, r *http.Request, admi
 	writeJSONResponse(w, map[string]interface{}{"success": true})
 }
 
+func (a *App) handleAdminSite(w http.ResponseWriter, r *http.Request, admin User) {
+	switch r.Method {
+	case http.MethodGet:
+		writeJSONResponse(w, map[string]interface{}{"config": a.publicConfig()})
+	case http.MethodPost:
+		var req struct {
+			ListenAddr    string `json:"listen_addr"`
+			PublicBaseURL string `json:"public_base_url"`
+		}
+		if err := readJSON(r, &req); err != nil {
+			jsonError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		listen, port, err := normalizeListenAddr(req.ListenAddr)
+		if err != nil {
+			jsonError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		a.mu.Lock()
+		currentListen := a.config.ListenAddr
+		currentPublicURL := a.config.PublicBaseURL
+		a.mu.Unlock()
+		oldPort := listenPort(currentListen)
+		publicURL := strings.TrimSpace(req.PublicBaseURL)
+		if publicURL == "" {
+			publicURL = publicURLWithPort(currentPublicURL, port)
+		} else if port != oldPort {
+			publicURL = rewritePublicURLPort(publicURL, oldPort, port)
+		}
+		publicURL, err = normalizePublicBaseURL(publicURL)
+		if err != nil {
+			jsonError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		a.mu.Lock()
+		oldListen := a.config.ListenAddr
+		a.config.ListenAddr = listen
+		a.config.PublicBaseURL = publicURL
+		configErr := a.saveConfigLocked()
+		if configErr == nil {
+			a.auditWithIPLocked(admin.ID, "update_site_config", fmt.Sprintf("listen=%s public_url=%s", listen, publicURL), clientIP(r))
+			configErr = a.saveLocked()
+		}
+		config := a.publicConfigLocked()
+		a.mu.Unlock()
+		if configErr != nil {
+			jsonError(w, http.StatusInternalServerError, configErr.Error())
+			return
+		}
+		restartRequired := oldListen != listen
+		log.Printf("[config] site config updated by=%q listen=%s public_url=%s restart_required=%t", admin.Username, listen, publicURL, restartRequired)
+		writeJSONResponse(w, map[string]interface{}{"success": true, "config": config, "restart_required": restartRequired})
+	default:
+		jsonError(w, http.StatusMethodNotAllowed, "method not allowed")
+	}
+}
+
 func (a *App) handleAdminSynology(w http.ResponseWriter, r *http.Request, admin User) {
 	switch r.Method {
 	case http.MethodGet:
@@ -1908,6 +2111,137 @@ func (a *App) handleAdminSynology(w http.ResponseWriter, r *http.Request, admin 
 	default:
 		jsonError(w, http.StatusMethodNotAllowed, "method not allowed")
 	}
+}
+
+func (a *App) handleAdminMail(w http.ResponseWriter, r *http.Request, admin User) {
+	switch r.Method {
+	case http.MethodGet:
+		a.mu.Lock()
+		config := a.mailConfigLocked()
+		a.mu.Unlock()
+		writeJSONResponse(w, map[string]interface{}{"config": config})
+	case http.MethodPost:
+		var req struct {
+			SMTPEnabled           bool   `json:"smtp_enabled"`
+			SMTPHost              string `json:"smtp_host"`
+			SMTPPort              int    `json:"smtp_port"`
+			SMTPSecure            string `json:"smtp_secure"`
+			SMTPUsername          string `json:"smtp_username"`
+			SMTPPassword          string `json:"smtp_password"`
+			SMTPFromEmail         string `json:"smtp_from_email"`
+			SMTPFromName          string `json:"smtp_from_name"`
+			MailEventJobNASDone   bool   `json:"mail_event_job_nas_done"`
+			MailEventJobCloudDone bool   `json:"mail_event_job_cloud_done"`
+			MailEventJobFailed    bool   `json:"mail_event_job_failed"`
+			MailEventLoginBan     bool   `json:"mail_event_login_ban"`
+		}
+		if err := readJSON(r, &req); err != nil {
+			jsonError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		a.mu.Lock()
+		next := a.config
+		a.mu.Unlock()
+		next.SMTPEnabled = req.SMTPEnabled
+		next.SMTPHost = strings.TrimSpace(req.SMTPHost)
+		next.SMTPPort = req.SMTPPort
+		next.SMTPSecure = normalizeSMTPSecure(req.SMTPSecure)
+		next.SMTPUsername = strings.TrimSpace(req.SMTPUsername)
+		if req.SMTPPassword != "" {
+			next.SMTPPassword = req.SMTPPassword
+		} else if next.SMTPUsername == "" {
+			next.SMTPPassword = ""
+		}
+		next.SMTPFromEmail = strings.TrimSpace(req.SMTPFromEmail)
+		next.SMTPFromName = strings.TrimSpace(req.SMTPFromName)
+		next.MailEventJobNASDone = req.MailEventJobNASDone
+		next.MailEventJobCloudDone = req.MailEventJobCloudDone
+		next.MailEventJobFailed = req.MailEventJobFailed
+		next.MailEventLoginBan = req.MailEventLoginBan
+		normalizeConfig(&next)
+		if next.SMTPEnabled {
+			if next.SMTPHost == "" {
+				jsonError(w, http.StatusBadRequest, "smtp server is required")
+				return
+			}
+			if next.SMTPPort <= 0 || next.SMTPPort > 65535 {
+				jsonError(w, http.StatusBadRequest, "smtp port must be between 1 and 65535")
+				return
+			}
+			if next.SMTPFromEmail == "" {
+				next.SMTPFromEmail = next.SMTPUsername
+			}
+			if _, err := mail.ParseAddress(next.SMTPFromEmail); err != nil {
+				jsonError(w, http.StatusBadRequest, "sender email is invalid")
+				return
+			}
+		}
+		a.mu.Lock()
+		a.config = next
+		configErr := a.saveConfigLocked()
+		if configErr == nil {
+			a.auditWithIPLocked(admin.ID, "update_mail_config", fmt.Sprintf("enabled=%t host=%s port=%d secure=%s events=%t/%t/%t/%t", next.SMTPEnabled, next.SMTPHost, next.SMTPPort, next.SMTPSecure, next.MailEventJobNASDone, next.MailEventJobCloudDone, next.MailEventJobFailed, next.MailEventLoginBan), clientIP(r))
+			configErr = a.saveLocked()
+		}
+		config := a.mailConfigLocked()
+		a.mu.Unlock()
+		if configErr != nil {
+			jsonError(w, http.StatusInternalServerError, configErr.Error())
+			return
+		}
+		log.Printf("[mail] smtp config updated by=%q enabled=%t host=%s port=%d secure=%s username_set=%t from=%s", admin.Username, next.SMTPEnabled, next.SMTPHost, next.SMTPPort, next.SMTPSecure, next.SMTPUsername != "", next.SMTPFromEmail)
+		writeJSONResponse(w, map[string]interface{}{"success": true, "config": config})
+	default:
+		jsonError(w, http.StatusMethodNotAllowed, "method not allowed")
+	}
+}
+
+func (a *App) handleAdminMailTest(w http.ResponseWriter, r *http.Request, admin User) {
+	if r.Method != http.MethodPost {
+		jsonError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	var req struct {
+		TestTo string `json:"test_to"`
+	}
+	if err := readJSON(r, &req); err != nil {
+		jsonError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	var recipients []string
+	if strings.TrimSpace(req.TestTo) != "" {
+		var err error
+		recipients, err = validateEmailList([]string{req.TestTo})
+		if err != nil {
+			jsonError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+	} else {
+		a.mu.Lock()
+		for _, u := range a.state.Users {
+			if u.ID == admin.ID {
+				recipients = append(recipients, u.Emails...)
+				break
+			}
+		}
+		a.mu.Unlock()
+		recipients = normalizeEmailList(recipients)
+	}
+	if len(recipients) == 0 {
+		jsonError(w, http.StatusBadRequest, "test recipient email is required")
+		return
+	}
+	if err := a.sendMail(recipients, appName+" 测试邮件", "这是一封来自 PVE Backup Web 的测试邮件。如果你能看到它，说明 SMTP 配置已经可以正常发送。"); err != nil {
+		log.Printf("[mail] test email failed by=%q to=%d error=%v", admin.Username, len(recipients), err)
+		jsonError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	a.mu.Lock()
+	a.auditWithIPLocked(admin.ID, "send_test_mail", fmt.Sprintf("to=%d", len(recipients)), clientIP(r))
+	_ = a.saveLocked()
+	a.mu.Unlock()
+	log.Printf("[mail] test email sent by=%q to=%d", admin.Username, len(recipients))
+	writeJSONResponse(w, map[string]interface{}{"success": true, "sent": len(recipients)})
 }
 
 func (a *App) handleAdminAnnouncement(w http.ResponseWriter, r *http.Request, admin User) {
@@ -2465,6 +2799,14 @@ func (a *App) updateJob(id int64, fn func(*Job)) {
 	if updated.ID != 0 {
 		if before.Stage != updated.Stage {
 			log.Printf("[job] stage changed id=%d %s -> %s", updated.ID, before.Stage, updated.Stage)
+			switch updated.Stage {
+			case "NASCompleted":
+				go a.notifyJobMail(updated.ID, mailEventJobNASDone)
+			case "CloudCompleted":
+				go a.notifyJobMail(updated.ID, mailEventJobCloudDone)
+			case "Failed":
+				go a.notifyJobMail(updated.ID, mailEventJobFailed)
+			}
 		}
 		if before.Error != updated.Error && updated.Error != "" {
 			log.Printf("[job] error updated id=%d stage=%s error=%s", updated.ID, updated.Stage, updated.Error)
@@ -2505,6 +2847,23 @@ func (a *App) broadcast(t string, data interface{}) {
 		default:
 		}
 	}
+}
+
+func (a *App) eventDataForUser(ev Event, viewer User) (interface{}, bool) {
+	if ev.Type != "job" {
+		return ev.Data, true
+	}
+	job, ok := ev.Data.(Job)
+	if !ok {
+		return ev.Data, true
+	}
+	if !viewer.IsAdmin && job.UserID != viewer.ID {
+		return nil, false
+	}
+	a.mu.Lock()
+	data := a.publicJobLocked(job, viewer)
+	a.mu.Unlock()
+	return data, true
 }
 
 func (a *App) packageDirectory(ctx context.Context, job Job, progress func(done int64)) (string, int64, func(), error) {
@@ -2644,6 +3003,7 @@ func (a *App) publicConfig() map[string]interface{} {
 func (a *App) publicConfigLocked() map[string]interface{} {
 	return map[string]interface{}{
 		"listen_addr":               a.config.ListenAddr,
+		"listen_port":               listenPort(a.config.ListenAddr),
 		"public_base_url":           a.config.PublicBaseURL,
 		"synology_base_url":         a.config.SynologyBaseURL,
 		"synology_username":         a.config.SynologyUsername,
@@ -2651,6 +3011,35 @@ func (a *App) publicConfigLocked() map[string]interface{} {
 		"synology_cloud_target_dir": a.config.SynologyCloudTargetDir,
 		"synology_password_set":     a.config.SynologyPassword != "",
 		"verify_tls":                a.config.VerifyTLS,
+		"smtp_enabled":              a.config.SMTPEnabled,
+		"smtp_host":                 a.config.SMTPHost,
+		"smtp_port":                 a.config.SMTPPort,
+		"smtp_secure":               a.config.SMTPSecure,
+		"smtp_username":             a.config.SMTPUsername,
+		"smtp_from_email":           a.config.SMTPFromEmail,
+		"smtp_from_name":            a.config.SMTPFromName,
+		"smtp_password_set":         a.config.SMTPPassword != "",
+		"mail_event_job_nas_done":   a.config.MailEventJobNASDone,
+		"mail_event_job_cloud_done": a.config.MailEventJobCloudDone,
+		"mail_event_job_failed":     a.config.MailEventJobFailed,
+		"mail_event_login_ban":      a.config.MailEventLoginBan,
+	}
+}
+
+func (a *App) mailConfigLocked() map[string]interface{} {
+	return map[string]interface{}{
+		"smtp_enabled":              a.config.SMTPEnabled,
+		"smtp_host":                 a.config.SMTPHost,
+		"smtp_port":                 a.config.SMTPPort,
+		"smtp_secure":               a.config.SMTPSecure,
+		"smtp_username":             a.config.SMTPUsername,
+		"smtp_from_email":           a.config.SMTPFromEmail,
+		"smtp_from_name":            a.config.SMTPFromName,
+		"smtp_password_set":         a.config.SMTPPassword != "",
+		"mail_event_job_nas_done":   a.config.MailEventJobNASDone,
+		"mail_event_job_cloud_done": a.config.MailEventJobCloudDone,
+		"mail_event_job_failed":     a.config.MailEventJobFailed,
+		"mail_event_login_ban":      a.config.MailEventLoginBan,
 	}
 }
 
@@ -2672,6 +3061,316 @@ func (a *App) appendJobEventLocked(j Job, message string) {
 	if len(a.state.JobEvents) > 10000 {
 		a.state.JobEvents = a.state.JobEvents[len(a.state.JobEvents)-10000:]
 	}
+}
+
+func (a *App) notifyJobMail(jobID int64, event string) {
+	a.mu.Lock()
+	if !mailEventEnabled(a.config, event) {
+		a.mu.Unlock()
+		return
+	}
+	var job *Job
+	for i := range a.state.Jobs {
+		if a.state.Jobs[i].ID == jobID {
+			job = &a.state.Jobs[i]
+			break
+		}
+	}
+	if job == nil || containsString(job.NotifiedEvents, event) {
+		a.mu.Unlock()
+		return
+	}
+	var owner User
+	foundOwner := false
+	for _, u := range a.state.Users {
+		if u.ID == job.UserID {
+			owner = u
+			foundOwner = true
+			break
+		}
+	}
+	recipients := normalizeEmailList(owner.Emails)
+	if !foundOwner || !owner.NotifyJobDone || len(recipients) == 0 {
+		a.mu.Unlock()
+		return
+	}
+	cfg := a.config
+	sourcePath, nasPath := a.jobMailDisplayPathsLocked(*job, owner)
+	job.NotifiedEvents = append(job.NotifiedEvents, event)
+	snapshot := *job
+	_ = a.saveLocked()
+	a.mu.Unlock()
+
+	subject, textBody, htmlBody := jobMailContent(snapshot, owner, event, sourcePath, nasPath)
+	if err := sendHTMLMailWithConfig(cfg, recipients, subject, textBody, htmlBody); err != nil {
+		log.Printf("[mail] job notification failed job=%d event=%s user=%q recipients=%d error=%v", snapshot.ID, event, owner.Username, len(recipients), err)
+		return
+	}
+	log.Printf("[mail] job notification sent job=%d event=%s user=%q recipients=%d", snapshot.ID, event, owner.Username, len(recipients))
+}
+
+func (a *App) notifyLoginBan(ban LoginBan) {
+	a.mu.Lock()
+	if !a.config.SMTPEnabled || !a.config.MailEventLoginBan {
+		a.mu.Unlock()
+		return
+	}
+	cfg := a.config
+	var recipients []string
+	for _, u := range a.state.Users {
+		if u.IsAdmin && u.NotifyAdminLogs {
+			recipients = append(recipients, u.Emails...)
+		}
+	}
+	recipients = normalizeEmailList(recipients)
+	a.mu.Unlock()
+	if len(recipients) == 0 {
+		return
+	}
+	subject := appName + " 登录封禁通知"
+	body := strings.Join([]string{
+		"检测到登录失败次数达到阈值，系统已创建封禁规则。",
+		"",
+		"用户名：" + valueOrDash(ban.Username),
+		"IP 地址：" + valueOrDash(ban.IP),
+		"封禁方式：" + banDurationText(ban),
+		"原因：" + valueOrDash(ban.Reason),
+		"时间：" + valueOrDash(ban.CreatedAt),
+		"",
+		"这是站点管理日志通知。",
+	}, "\n")
+	if err := sendMailWithConfig(cfg, recipients, subject, body); err != nil {
+		log.Printf("[mail] admin notification failed event=%s ban_id=%d recipients=%d error=%v", mailEventLoginBan, ban.ID, len(recipients), err)
+		return
+	}
+	log.Printf("[mail] admin notification sent event=%s ban_id=%d recipients=%d", mailEventLoginBan, ban.ID, len(recipients))
+}
+
+func (a *App) sendMail(recipients []string, subject, body string) error {
+	a.mu.Lock()
+	cfg := a.config
+	a.mu.Unlock()
+	return sendMailWithConfig(cfg, recipients, subject, body)
+}
+
+func sendMailWithConfig(cfg Config, recipients []string, subject, body string) error {
+	return sendMailBodyWithConfig(cfg, recipients, subject, "text/plain; charset=UTF-8", body)
+}
+
+func sendHTMLMailWithConfig(cfg Config, recipients []string, subject, textBody, htmlBody string) error {
+	if strings.TrimSpace(htmlBody) == "" {
+		htmlBody = "<pre>" + html.EscapeString(textBody) + "</pre>"
+	}
+	return sendMailBodyWithConfig(cfg, recipients, subject, "text/html; charset=UTF-8", htmlBody)
+}
+
+func sendMailBodyWithConfig(cfg Config, recipients []string, subject, contentType, body string) error {
+	recipients = normalizeEmailList(recipients)
+	if len(recipients) == 0 {
+		return errors.New("no mail recipients")
+	}
+	if !cfg.SMTPEnabled {
+		return errors.New("smtp is not enabled")
+	}
+	if cfg.SMTPHost == "" || cfg.SMTPPort <= 0 || cfg.SMTPPort > 65535 {
+		return errors.New("smtp server is not configured")
+	}
+	fromEmail := strings.TrimSpace(cfg.SMTPFromEmail)
+	if fromEmail == "" {
+		fromEmail = strings.TrimSpace(cfg.SMTPUsername)
+	}
+	if _, err := mail.ParseAddress(fromEmail); err != nil {
+		return fmt.Errorf("sender email is invalid: %w", err)
+	}
+	message := buildMailMessage(cfg, fromEmail, recipients, subject, contentType, body)
+	log.Printf("[mail] sending smtp host=%s port=%d secure=%s to=%d subject=%q", cfg.SMTPHost, cfg.SMTPPort, cfg.SMTPSecure, len(recipients), subject)
+	return smtpSend(cfg, fromEmail, recipients, message)
+}
+
+func buildMailMessage(cfg Config, fromEmail string, recipients []string, subject, contentType, body string) []byte {
+	from := (&mail.Address{Name: strings.TrimSpace(cfg.SMTPFromName), Address: fromEmail}).String()
+	headers := []string{
+		"From: " + from,
+		"To: " + strings.Join(recipients, ", "),
+		"Subject: " + mime.QEncoding.Encode("UTF-8", subject),
+		"Date: " + time.Now().Format(time.RFC1123Z),
+		"MIME-Version: 1.0",
+		"Content-Type: " + contentType,
+		"Content-Transfer-Encoding: base64",
+	}
+	return []byte(strings.Join(headers, "\r\n") + "\r\n\r\n" + wrapBase64(base64.StdEncoding.EncodeToString([]byte(body))))
+}
+
+func smtpSend(cfg Config, from string, recipients []string, message []byte) error {
+	addr := net.JoinHostPort(cfg.SMTPHost, strconv.Itoa(cfg.SMTPPort))
+	dialer := &net.Dialer{Timeout: 20 * time.Second}
+	var conn net.Conn
+	var err error
+	if cfg.SMTPSecure == "tls" {
+		conn, err = tls.DialWithDialer(dialer, "tcp", addr, &tls.Config{ServerName: cfg.SMTPHost, MinVersion: tls.VersionTLS12})
+	} else {
+		conn, err = dialer.Dial("tcp", addr)
+	}
+	if err != nil {
+		return err
+	}
+	client, err := smtp.NewClient(conn, cfg.SMTPHost)
+	if err != nil {
+		_ = conn.Close()
+		return err
+	}
+	defer client.Close()
+	if cfg.SMTPSecure == "starttls" {
+		ok, _ := client.Extension("STARTTLS")
+		if !ok {
+			return errors.New("smtp server does not support STARTTLS")
+		}
+		if err := client.StartTLS(&tls.Config{ServerName: cfg.SMTPHost, MinVersion: tls.VersionTLS12}); err != nil {
+			return err
+		}
+	}
+	if strings.TrimSpace(cfg.SMTPUsername) != "" {
+		auth := smtp.PlainAuth("", cfg.SMTPUsername, cfg.SMTPPassword, cfg.SMTPHost)
+		if err := client.Auth(auth); err != nil {
+			return err
+		}
+	}
+	if err := client.Mail(from); err != nil {
+		return err
+	}
+	for _, recipient := range recipients {
+		if err := client.Rcpt(recipient); err != nil {
+			return err
+		}
+	}
+	w, err := client.Data()
+	if err != nil {
+		return err
+	}
+	if _, err := w.Write(message); err != nil {
+		_ = w.Close()
+		return err
+	}
+	if err := w.Close(); err != nil {
+		return err
+	}
+	return client.Quit()
+}
+
+func (a *App) jobMailDisplayPathsLocked(job Job, owner User) (string, string) {
+	if owner.IsAdmin {
+		sourcePath := job.SourceAbsPath
+		if strings.TrimSpace(sourcePath) == "" {
+			sourcePath = displaySourceRelPath(job.SourceRelPath)
+		}
+		return sourcePath, job.NASPath
+	}
+	return displaySourceRelPath(job.SourceRelPath), a.displayNASPathLocked(job, owner)
+}
+
+func jobMailContent(job Job, owner User, event, sourcePath, nasPath string) (string, string, string) {
+	name := jobDisplayName(job)
+	headline := "备份任务已完成"
+	subjectPrefix := "文件同步已完成"
+	switch event {
+	case mailEventJobNASDone:
+		subjectPrefix = "文件同步已完成"
+	case mailEventJobCloudDone:
+		subjectPrefix = "文件已上传到云端"
+	case mailEventJobFailed:
+		headline = "备份任务未完成"
+		subjectPrefix = "备份任务失败"
+	}
+	subject := fmt.Sprintf("%s - %s", subjectPrefix, name)
+	filePath := valueOrDash(sourcePath)
+	if filePath == "" || filePath == "-" {
+		filePath = "根目录"
+	}
+	location := valueOrDash(nasPath)
+	size := humanBytes(job.SourceSize)
+	completedAt := valueOrDash(job.CompletedAt)
+	lines := []string{
+		headline,
+		"",
+		"文件：" + filePath,
+		"到达的位置：" + location,
+		"文件大小：" + size,
+		"完成时间：" + completedAt,
+	}
+	if job.Error != "" {
+		lines = append(lines, "错误信息："+job.Error)
+	}
+	lines = append(lines,
+		"",
+		"详细信息",
+		"任务编号："+strconv.FormatInt(job.ID, 10),
+		"用户："+owner.Username,
+		"当前状态："+stageName(job.Stage),
+		"创建时间："+valueOrDash(job.CreatedAt),
+		"开始时间："+valueOrDash(job.StartedAt),
+		"这是你的文件传输日志通知。",
+	)
+	htmlBody := jobMailHTML(headline, filePath, location, size, completedAt, job, owner)
+	return subject, strings.Join(lines, "\n"), htmlBody
+}
+
+func jobDisplayName(job Job) string {
+	rel := cleanRel(job.SourceRelPath)
+	if rel != "" {
+		name := path.Base(rel)
+		if name != "." && name != "/" && name != "" {
+			return name
+		}
+	}
+	name := path.Base(job.NASPath)
+	if name == "." || name == "/" || name == "" {
+		return "备份文件"
+	}
+	return name
+}
+
+func jobMailHTML(headline, filePath, location, size, completedAt string, job Job, owner User) string {
+	note := "文件已经处理完成，可以在对应位置查看。"
+	if job.Stage == "Failed" || job.Error != "" {
+		note = "任务没有完成，请在网页里查看原因。"
+	}
+	errBlock := ""
+	if job.Error != "" {
+		errBlock = `<div style="margin-top:14px;padding:12px;border-radius:8px;background:#fef2f2;color:#991b1b;">` + html.EscapeString(job.Error) + `</div>`
+	}
+	rows := []string{
+		htmlRow("文件", filePath),
+		htmlRow("到达的位置", location),
+		htmlRow("文件大小", size),
+		htmlRow("完成时间", completedAt),
+	}
+	details := []string{
+		htmlRow("任务编号", strconv.FormatInt(job.ID, 10)),
+		htmlRow("用户", owner.Username),
+		htmlRow("当前状态", stageName(job.Stage)),
+		htmlRow("创建时间", valueOrDash(job.CreatedAt)),
+		htmlRow("开始时间", valueOrDash(job.StartedAt)),
+	}
+	return `<!doctype html><html><body style="margin:0;background:#f3f6fa;padding:24px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Arial,'Microsoft YaHei',sans-serif;color:#17202a;">
+<div style="max-width:620px;margin:0 auto;background:#ffffff;border:1px solid #e2e8f0;border-radius:12px;overflow:hidden;">
+  <div style="padding:24px 26px;background:#0f766e;color:#ffffff;">
+    <div style="font-size:22px;font-weight:700;line-height:1.35;">` + html.EscapeString(headline) + `</div>
+    <div style="margin-top:6px;font-size:14px;opacity:.9;">` + html.EscapeString(note) + `</div>
+  </div>
+  <div style="padding:22px 26px;">
+    <table role="presentation" style="width:100%;border-collapse:collapse;">` + strings.Join(rows, "") + `</table>` + errBlock + `
+    <div style="margin-top:22px;padding-top:16px;border-top:1px solid #e5e7eb;color:#64748b;font-size:12px;line-height:1.7;">
+      <div style="font-weight:700;color:#475569;margin-bottom:6px;">详细信息</div>
+      <table role="presentation" style="width:100%;border-collapse:collapse;font-size:12px;color:#64748b;">` + strings.Join(details, "") + `</table>
+      <div style="margin-top:10px;">这是你的文件传输日志通知。</div>
+    </div>
+  </div>
+</div>
+</body></html>`
+}
+
+func htmlRow(label, value string) string {
+	return `<tr><td style="width:110px;padding:9px 0;color:#64748b;vertical-align:top;">` + html.EscapeString(label) + `</td><td style="padding:9px 0;color:#111827;font-weight:600;word-break:break-all;">` + html.EscapeString(valueOrDash(value)) + `</td></tr>`
 }
 
 type SynologyClient struct {
@@ -3048,14 +3747,60 @@ func jsonErrorWith(w http.ResponseWriter, status int, msg string, extra map[stri
 	_ = json.NewEncoder(w).Encode(payload)
 }
 
+func publicRoot(root Root, viewer User) Root {
+	if viewer.IsAdmin {
+		return root
+	}
+	root.Path = ""
+	return root
+}
+
+func (a *App) publicJobLocked(j Job, viewer User) map[string]interface{} {
+	sourceAbsPath := j.SourceAbsPath
+	nasPath := j.NASPath
+	stagingPath := j.StagingPath
+	if !viewer.IsAdmin {
+		sourceAbsPath = ""
+		stagingPath = ""
+		nasPath = a.displayNASPathLocked(j, viewer)
+	}
+	return map[string]interface{}{
+		"id":               j.ID,
+		"user_id":          j.UserID,
+		"root_id":          j.RootID,
+		"source_rel_path":  j.SourceRelPath,
+		"source_abs_path":  sourceAbsPath,
+		"source_is_dir":    j.SourceIsDir,
+		"source_size":      j.SourceSize,
+		"source_mtime":     j.SourceMtime,
+		"stage":            j.Stage,
+		"transfer_bytes":   j.TransferBytes,
+		"transfer_total":   j.TransferTotal,
+		"transfer_speed":   j.TransferSpeed,
+		"cloud_bytes":      j.CloudBytes,
+		"cloud_total":      j.CloudTotal,
+		"cloud_speed":      j.CloudSpeed,
+		"nas_path":         nasPath,
+		"staging_path":     stagingPath,
+		"error":            j.Error,
+		"created_at":       j.CreatedAt,
+		"started_at":       j.StartedAt,
+		"completed_at":     j.CompletedAt,
+		"cloud_updated_at": j.CloudUpdatedAt,
+	}
+}
+
 func publicUser(u User) map[string]interface{} {
 	return map[string]interface{}{
-		"id":            u.ID,
-		"username":      u.Username,
-		"is_admin":      u.IsAdmin,
-		"allowed_roots": u.AllowedRoots,
-		"upload_dir":    u.UploadDir,
-		"created_at":    u.CreatedAt,
+		"id":                u.ID,
+		"username":          u.Username,
+		"is_admin":          u.IsAdmin,
+		"allowed_roots":     u.AllowedRoots,
+		"upload_dir":        u.UploadDir,
+		"emails":            normalizeEmailList(u.Emails),
+		"notify_job_done":   u.NotifyJobDone,
+		"notify_admin_logs": u.NotifyAdminLogs && u.IsAdmin,
+		"created_at":        u.CreatedAt,
 	}
 }
 
@@ -3144,8 +3889,212 @@ func normalizeUserUploadDir(p string) string {
 	return synoClean(p)
 }
 
+func normalizeEmailList(input []string) []string {
+	emails, _ := parseEmailList(input, false)
+	return emails
+}
+
+func validateEmailList(input []string) ([]string, error) {
+	return parseEmailList(input, true)
+}
+
+func parseEmailList(input []string, strict bool) ([]string, error) {
+	seen := map[string]bool{}
+	var out []string
+	for _, raw := range input {
+		parts := strings.FieldsFunc(raw, func(r rune) bool {
+			return r == ',' || r == ';' || r == '\n' || r == '\r'
+		})
+		for _, part := range parts {
+			part = strings.TrimSpace(part)
+			if part == "" {
+				continue
+			}
+			addr, err := mail.ParseAddress(part)
+			if err != nil {
+				if strict {
+					return nil, fmt.Errorf("invalid email: %s", part)
+				}
+				continue
+			}
+			email := strings.ToLower(strings.TrimSpace(addr.Address))
+			if email == "" {
+				continue
+			}
+			if !seen[email] {
+				seen[email] = true
+				out = append(out, email)
+			}
+		}
+	}
+	if strict && len(out) > 10 {
+		return nil, errors.New("you can bind at most 10 email addresses")
+	}
+	return out, nil
+}
+
 func sameSynoPath(a, b string) bool {
 	return synoClean(a) == synoClean(b)
+}
+
+func normalizeListenAddr(raw string) (string, int, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		raw = defaultAddr
+	}
+	if _, err := strconv.Atoi(raw); err == nil {
+		raw = ":" + raw
+	}
+	var portRaw string
+	if strings.HasPrefix(raw, ":") {
+		portRaw = strings.TrimPrefix(raw, ":")
+	} else {
+		_, port, err := net.SplitHostPort(raw)
+		if err != nil {
+			return "", 0, errors.New("web port must be a number between 1 and 65535")
+		}
+		portRaw = port
+	}
+	port, err := strconv.Atoi(portRaw)
+	if err != nil || port <= 0 || port > 65535 {
+		return "", 0, errors.New("web port must be a number between 1 and 65535")
+	}
+	return ":" + strconv.Itoa(port), port, nil
+}
+
+func listenPort(addr string) int {
+	_, port, err := normalizeListenAddr(addr)
+	if err != nil {
+		return 60000
+	}
+	return port
+}
+
+func normalizePublicBaseURL(raw string) (string, error) {
+	raw = strings.TrimRight(strings.TrimSpace(raw), "/")
+	u, err := url.Parse(raw)
+	if err != nil || u.Scheme == "" || u.Host == "" {
+		return "", errors.New("public access URL must include http:// or https:// and host")
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return "", errors.New("public access URL must use http or https")
+	}
+	u.Path = strings.TrimRight(u.Path, "/")
+	u.RawQuery = ""
+	u.Fragment = ""
+	return strings.TrimRight(u.String(), "/"), nil
+}
+
+func publicURLWithPort(current string, port int) string {
+	u, err := url.Parse(strings.TrimSpace(current))
+	if err != nil || u.Scheme == "" || u.Host == "" {
+		return "https://127.0.0.1:" + strconv.Itoa(port)
+	}
+	host := u.Hostname()
+	if host == "" {
+		return "https://127.0.0.1:" + strconv.Itoa(port)
+	}
+	u.Host = net.JoinHostPort(host, strconv.Itoa(port))
+	u.RawQuery = ""
+	u.Fragment = ""
+	return strings.TrimRight(u.String(), "/")
+}
+
+func rewritePublicURLPort(raw string, oldPort, newPort int) string {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || u.Scheme == "" || u.Host == "" {
+		return raw
+	}
+	if u.Port() == strconv.Itoa(oldPort) {
+		u.Host = net.JoinHostPort(u.Hostname(), strconv.Itoa(newPort))
+		return strings.TrimRight(u.String(), "/")
+	}
+	return raw
+}
+
+func normalizeSMTPSecure(raw string) string {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "tls", "ssl", "ssl_tls":
+		return "tls"
+	case "plain", "none":
+		return "plain"
+	default:
+		return "starttls"
+	}
+}
+
+func mailEventEnabled(cfg Config, event string) bool {
+	if !cfg.SMTPEnabled {
+		return false
+	}
+	switch event {
+	case mailEventJobNASDone:
+		return cfg.MailEventJobNASDone
+	case mailEventJobCloudDone:
+		return cfg.MailEventJobCloudDone
+	case mailEventJobFailed:
+		return cfg.MailEventJobFailed
+	case mailEventLoginBan:
+		return cfg.MailEventLoginBan
+	default:
+		return false
+	}
+}
+
+func containsString(list []string, value string) bool {
+	for _, item := range list {
+		if item == value {
+			return true
+		}
+	}
+	return false
+}
+
+func wrapBase64(s string) string {
+	if s == "" {
+		return ""
+	}
+	var b strings.Builder
+	for len(s) > 76 {
+		b.WriteString(s[:76])
+		b.WriteString("\r\n")
+		s = s[76:]
+	}
+	b.WriteString(s)
+	b.WriteString("\r\n")
+	return b.String()
+}
+
+func valueOrDash(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "-"
+	}
+	return value
+}
+
+func banDurationText(ban LoginBan) string {
+	if ban.Permanent {
+		return "永久封禁"
+	}
+	return "封禁至 " + valueOrDash(ban.Until)
+}
+
+func humanBytes(n int64) string {
+	if n <= 0 {
+		return "0 B"
+	}
+	units := []string{"B", "KB", "MB", "GB", "TB"}
+	v := float64(n)
+	i := 0
+	for v >= 1024 && i < len(units)-1 {
+		v /= 1024
+		i++
+	}
+	if i == 0 {
+		return fmt.Sprintf("%d %s", n, units[i])
+	}
+	return fmt.Sprintf("%.1f %s", v, units[i])
 }
 
 func jsonStringArray(v []string) string {
@@ -3226,6 +4175,42 @@ func (a *App) targetDirForUserLocked(u User) string {
 		return synoClean(u.UploadDir)
 	}
 	return synoClean(a.config.SynologyCloudTargetDir)
+}
+
+func (a *App) displayNASPathLocked(j Job, viewer User) string {
+	if viewer.IsAdmin {
+		return j.NASPath
+	}
+	base := a.targetDirForUserLocked(viewer)
+	return displayRelativeNASPath(j.NASPath, base)
+}
+
+func displayRelativeNASPath(fullPath, basePath string) string {
+	full := synoClean(fullPath)
+	base := synoClean(basePath)
+	prefix := strings.TrimSuffix(base, "/") + "/"
+	if full == base {
+		return path.Base(full)
+	}
+	if strings.HasPrefix(full, prefix) {
+		rel := strings.TrimPrefix(full, prefix)
+		if rel != "" {
+			return rel
+		}
+	}
+	name := path.Base(full)
+	if name == "." || name == "/" || name == "" {
+		return "-"
+	}
+	return name
+}
+
+func displaySourceRelPath(rel string) string {
+	rel = cleanRel(rel)
+	if rel == "" {
+		return "根目录"
+	}
+	return rel
 }
 
 func parseLimit(raw string, fallback, max int) int {
@@ -3915,10 +4900,27 @@ const indexHTML = `<!doctype html>
       <div class="panel" style="grid-column:1/-1"><h2>文件列表</h2><div id="files" class="list"></div></div>
     </section>
     <section id="tab-jobs" class="panel hidden"><h2>备份任务</h2><div class="body"><div id="jobs" class="stack"></div></div></section>
-    <section id="tab-account" class="panel hidden"><h2>账户</h2><div class="body stack"><input id="currentPass" class="field" type="password" placeholder="当前密码"><input id="newSelfPass" class="field" type="password" placeholder="新密码，至少 8 位"><button onclick="changePassword()">修改密码</button><div id="accountMsg"></div></div></section>
+    <section id="tab-account" class="grid hidden">
+      <div class="panel"><h2>密码</h2><div class="body stack"><input id="currentPass" class="field" type="password" placeholder="当前密码"><input id="newSelfPass" class="field" type="password" placeholder="新密码，至少 8 位"><button onclick="changePassword()">修改密码</button><div id="accountMsg"></div></div></div>
+      <div class="panel"><h2>邮箱通知</h2><div class="body stack">
+        <textarea id="accountEmails" placeholder="每行一个邮箱，也可以用逗号分隔"></textarea>
+        <label><input type="checkbox" id="notifyJobDone"> 接收文件传输日志</label>
+        <label class="adminOnly"><input type="checkbox" id="notifyAdminLogs"> 接收站点管理日志</label>
+        <div class="row"><button onclick="saveAccountNotifications()">保存邮箱设置</button><span class="small">最多绑定 10 个邮箱</span></div>
+        <div id="accountMailMsg"></div>
+      </div></div>
+    </section>
     <section id="tab-admin" class="grid hidden">
       <div class="panel"><h2>目录根</h2><div class="body stack"><input id="rootName" class="field" placeholder="名称"><input id="rootPath" class="field" placeholder="/path/on/pve"><button onclick="addRoot()">添加目录</button><div id="adminRoots"></div></div></div>
       <div class="panel"><h2>用户</h2><div class="body stack"><input id="newUser" class="field" placeholder="用户名"><input id="newPass" class="field" placeholder="密码，至少 8 位"><input id="newUploadDir" class="field" placeholder="群晖上传目录，留空使用默认"><label><input type="checkbox" id="newAdmin"> 管理员</label><button onclick="addUser()">创建用户</button><div id="adminUsers"></div></div></div>
+      <div class="panel wide"><h2>网页访问</h2><div class="body stack">
+        <div class="formGrid">
+          <label>网页端口<input id="sitePort" class="field" type="number" min="1" max="65535" placeholder="60000"></label>
+          <label>公开访问地址<input id="publicBaseURL" class="field" placeholder="https://202.189.4.217:60000"></label>
+        </div>
+        <div class="row"><button onclick="saveSiteConfig()">保存访问设置</button><span class="small">端口保存后重启程序或服务生效</span></div>
+        <div id="siteMsg"></div>
+      </div></div>
       <div class="panel wide"><h2>群晖连接</h2><div class="body stack">
         <div class="formGrid">
           <label>DSM 地址<input id="synoBaseURL" class="field" placeholder="http://192.168.2.5:5000"></label>
@@ -3931,6 +4933,26 @@ const indexHTML = `<!doctype html>
         <div class="row"><button onclick="saveSynology()">保存配置</button><button class="secondary" onclick="testSynology()">测试群晖 API</button></div>
         <div id="synologyMsg"></div>
         <pre id="synologyInfo" style="white-space:pre-wrap;overflow:auto"></pre>
+      </div></div>
+      <div class="panel wide"><h2>邮件发送</h2><div class="body stack">
+        <div class="formGrid">
+          <label style="align-self:end"><input type="checkbox" id="smtpEnabled"> 启用 SMTP 发信</label>
+          <label>加密方式<select id="smtpSecure" class="field"><option value="starttls">STARTTLS</option><option value="tls">SSL/TLS</option><option value="plain">普通连接</option></select></label>
+          <label>SMTP 服务器<input id="smtpHost" class="field" placeholder="smtp.qq.com"></label>
+          <label>SMTP 端口<input id="smtpPort" class="field" type="number" min="1" max="65535" placeholder="587"></label>
+          <label>SMTP 用户名<input id="smtpUsername" class="field" autocomplete="off"></label>
+          <label>SMTP 密码/授权码<input id="smtpPassword" class="field" type="password" placeholder="留空则不修改"></label>
+          <label>发件邮箱<input id="smtpFromEmail" class="field" placeholder="name@example.com"></label>
+          <label>发件名称<input id="smtpFromName" class="field" placeholder="PVE Backup Web"></label>
+        </div>
+        <div class="soft stack">
+          <label><input type="checkbox" id="mailEventJobNASDone"> 文件上传到群晖后通知</label>
+          <label><input type="checkbox" id="mailEventJobCloudDone"> Cloud Sync 完成后通知</label>
+          <label><input type="checkbox" id="mailEventJobFailed"> 任务失败时通知</label>
+          <label><input type="checkbox" id="mailEventLoginBan"> 用户或 IP 被封禁时通知管理员</label>
+        </div>
+        <div class="row"><button onclick="saveMailConfig()">保存邮件配置</button><input id="testMailTo" class="field" style="max-width:280px" placeholder="测试收件邮箱"><button class="secondary" onclick="sendTestMail()">发送测试邮件</button></div>
+        <div id="mailMsg"></div>
       </div></div>
       <div class="panel wide"><h2>登录风控</h2><div class="body stack">
         <div class="formGrid">
@@ -3998,6 +5020,10 @@ function bindElements(){
     currentPass:document.getElementById('currentPass'),
     newSelfPass:document.getElementById('newSelfPass'),
     accountMsg:document.getElementById('accountMsg'),
+    accountEmails:document.getElementById('accountEmails'),
+    notifyJobDone:document.getElementById('notifyJobDone'),
+    notifyAdminLogs:document.getElementById('notifyAdminLogs'),
+    accountMailMsg:document.getElementById('accountMailMsg'),
     adminRoots:document.getElementById('adminRoots'),
     adminUsers:document.getElementById('adminUsers'),
     synologyInfo:document.getElementById('synologyInfo'),
@@ -4007,6 +5033,9 @@ function bindElements(){
     newPass:document.getElementById('newPass'),
     newUploadDir:document.getElementById('newUploadDir'),
     newAdmin:document.getElementById('newAdmin'),
+    sitePort:document.getElementById('sitePort'),
+    publicBaseURL:document.getElementById('publicBaseURL'),
+    siteMsg:document.getElementById('siteMsg'),
     synoBaseURL:document.getElementById('synoBaseURL'),
     synoUsername:document.getElementById('synoUsername'),
     synoPassword:document.getElementById('synoPassword'),
@@ -4014,6 +5043,20 @@ function bindElements(){
     synoCloudTargetDir:document.getElementById('synoCloudTargetDir'),
     synoVerifyTLS:document.getElementById('synoVerifyTLS'),
     synologyMsg:document.getElementById('synologyMsg'),
+    smtpEnabled:document.getElementById('smtpEnabled'),
+    smtpHost:document.getElementById('smtpHost'),
+    smtpPort:document.getElementById('smtpPort'),
+    smtpSecure:document.getElementById('smtpSecure'),
+    smtpUsername:document.getElementById('smtpUsername'),
+    smtpPassword:document.getElementById('smtpPassword'),
+    smtpFromEmail:document.getElementById('smtpFromEmail'),
+    smtpFromName:document.getElementById('smtpFromName'),
+    mailEventJobNASDone:document.getElementById('mailEventJobNASDone'),
+    mailEventJobCloudDone:document.getElementById('mailEventJobCloudDone'),
+    mailEventJobFailed:document.getElementById('mailEventJobFailed'),
+    mailEventLoginBan:document.getElementById('mailEventLoginBan'),
+    testMailTo:document.getElementById('testMailTo'),
+    mailMsg:document.getElementById('mailMsg'),
     announcementText:document.getElementById('announcementText'),
     announcementMeta:document.getElementById('announcementMeta'),
     announcementMsg:document.getElementById('announcementMsg'),
@@ -4040,6 +5083,7 @@ function bytes(n){if(!n)return '0 B';const u=['B','KB','MB','GB','TB'];let i=0;w
 function pct(a,b){return b?Math.max(0,Math.min(100,a/b*100)):0}
 function esc(s){return String(s||'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]))}
 function timeText(s){if(!s)return '';const d=new Date(s);return Number.isNaN(d.getTime())?s:d.toLocaleString()}
+function displayPath(s){return s?String(s):'根目录'}
 function applyCaptcha(challenge){currentCaptcha=challenge||null;if(currentCaptcha){el.captchaImage.src=currentCaptcha.image_url+'?t='+Date.now();el.captchaAnswer.value='';el.captchaBox.classList.remove('hidden')}else{el.captchaBox.classList.add('hidden');el.captchaImage.removeAttribute('src');el.captchaAnswer.value=''}}
 async function refreshCaptcha(){const r=await api('/api/captcha/new');applyCaptcha(r.captcha)}
 function fileExt(name){
@@ -4082,10 +5126,10 @@ async function doLogin(){
   }
 }
 async function logout(){await api('/logout',{method:'POST',body:'{}'}).catch(()=>{});location.reload()}
-async function boot(justLoggedIn=false){try{const m=await api('/api/me');me=m.user;currentConfig=m.config||{};currentAnnouncement=m.announcement||{};el.loginBox.classList.add('hidden');el.appShell.classList.remove('hidden');el.who.textContent=me.username+(me.is_admin?' · 管理员':'');document.querySelectorAll('.adminOnly').forEach(x=>x.style.display=me.is_admin?'block':'none');if(me.is_admin){renderSynologyConfig();el.synoSummary.textContent='NAS: '+(currentConfig.synology_base_url||'-')+' → '+(currentConfig.synology_cloud_target_dir||'-')}else{el.synoSummary.textContent=''}connectEvents();await loadAll();if(justLoggedIn)showAnnouncement(currentAnnouncement)}catch(e){el.loginBox.classList.remove('hidden');el.appShell.classList.add('hidden')}}
+async function boot(justLoggedIn=false){try{const m=await api('/api/me');me=m.user;currentConfig=m.config||{};currentAnnouncement=m.announcement||{};el.loginBox.classList.add('hidden');el.appShell.classList.remove('hidden');el.who.textContent=me.username+(me.is_admin?' · 管理员':'');document.querySelectorAll('.adminOnly').forEach(x=>x.style.display=me.is_admin?'block':'none');renderAccountNotifications();if(me.is_admin){renderSiteConfig();renderSynologyConfig();renderMailConfig(currentConfig);el.synoSummary.textContent='NAS: '+(currentConfig.synology_base_url||'-')+' → '+(currentConfig.synology_cloud_target_dir||'-')}else{el.synoSummary.textContent=''}connectEvents();await loadAll();if(justLoggedIn)showAnnouncement(currentAnnouncement)}catch(e){el.loginBox.classList.remove('hidden');el.appShell.classList.add('hidden')}}
 function showTab(t){['files','jobs','account','admin','logs'].forEach(x=>document.getElementById('tab-'+x).classList.toggle('hidden',x!==t));if(t==='jobs')loadJobs();if(t==='admin')loadAdmin();if(t==='logs')loadLogs()}
 async function loadAll(){await loadRoots();await loadJobs();if(me&&me.is_admin)await loadAdmin().catch(()=>{})}
-async function loadRoots(){const r=await api('/api/roots');roots=r.roots||[];el.rootSelect.innerHTML=roots.map(x=>'<option value="'+x.id+'">'+esc(x.name)+' · '+esc(x.path)+'</option>').join('');if(roots.length&&!curRoot){curRoot=roots[0].id;el.rootSelect.value=curRoot;await openRoot()}else if(curRoot){el.rootSelect.value=curRoot}}
+async function loadRoots(){const r=await api('/api/roots');roots=r.roots||[];el.rootSelect.innerHTML=roots.map(x=>'<option value="'+x.id+'">'+esc(x.path?x.name+' · '+x.path:x.name)+'</option>').join('');if(roots.length&&!curRoot){curRoot=roots[0].id;el.rootSelect.value=curRoot;await openRoot()}else if(curRoot){el.rootSelect.value=curRoot}}
 async function openRoot(){curRoot=Number(el.rootSelect.value);curPath='';await loadFiles()}
 async function openDir(p){curPath=p||'';await loadFiles()}
 async function loadFiles(){
@@ -4142,7 +5186,7 @@ function renderJobs(){
       if(me?.is_admin)controls.push('<button class=secondary data-action="mark-cloud-completed" data-id="'+j.id+'">标记云端完成</button>');
     }
     if(!isJobBusy(j.stage))controls.push('<button class=danger data-action="delete-job" data-id="'+j.id+'">删除</button>');
-    return '<div class=panel><div class=body stack><div class=row><b>#'+j.id+'</b><span>'+esc(stageText(j.stage))+'</span><span class=small>'+(j.source_is_dir?'目录包 · ':'')+esc(j.source_rel_path)+'</span></div><div class=progress><div class=bar style="width:'+pct(a,b)+'%"></div></div><div class=small>'+bytes(a)+' / '+bytes(b)+' · NAS '+esc(j.nas_path)+' · '+(j.transfer_speed?bytes(j.transfer_speed)+'/s':'')+(j.cloud_speed?' · Cloud '+bytes(j.cloud_speed)+'/s':'')+'</div>'+(j.error?'<div class=error>'+esc(j.error)+'</div>':'')+'<div class=row>'+controls.join('')+'</div></div></div>';
+    return '<div class=panel><div class=body stack><div class=row><b>#'+j.id+'</b><span>'+esc(stageText(j.stage))+'</span><span class=small>'+(j.source_is_dir?'目录包 · ':'')+esc(displayPath(j.source_rel_path))+'</span></div><div class=progress><div class=bar style="width:'+pct(a,b)+'%"></div></div><div class=small>'+bytes(a)+' / '+bytes(b)+' · NAS '+esc(j.nas_path)+' · '+(j.transfer_speed?bytes(j.transfer_speed)+'/s':'')+(j.cloud_speed?' · Cloud '+bytes(j.cloud_speed)+'/s':'')+'</div>'+(j.error?'<div class=error>'+esc(j.error)+'</div>':'')+'<div class=row>'+controls.join('')+'</div></div></div>';
   }).join('')||'暂无任务';
 }
 async function loadAdmin(){
@@ -4155,11 +5199,15 @@ async function loadAdmin(){
   el.adminUsers.innerHTML=users.map(u=>{
     const rootChecks=roots.map(r=>'<label style="margin-right:10px"><input type=checkbox data-user="'+u.id+'" value="'+r.id+'" '+((u.allowed_roots||[]).includes(r.id)?'checked':'')+'> '+esc(r.name)+'</label>').join('');
     const deleteBtn=u.id===me.id?'':'<button class=danger data-action="delete-user" data-id="'+u.id+'">删除用户</button>';
-    return '<div class=panel><div class=body stack><div class=row><b>'+esc(u.username)+(u.is_admin?' · 管理员':'')+'</b><span class=pill>ID '+u.id+'</span></div><div class=soft>'+rootChecks+'</div><div class=row><button class=secondary onclick="saveUserRoots('+u.id+')">保存目录权限</button>'+deleteBtn+'</div><div class=row><input class=field style="max-width:360px" data-upload-user="'+u.id+'" placeholder="群晖上传目录，留空使用默认" value="'+esc(u.upload_dir||'')+'"><button class=secondary data-action="save-user-upload-dir" data-id="'+u.id+'">保存上传目录</button></div><div class=row><input class=field style="max-width:260px" type=password data-reset-user="'+u.id+'" placeholder="新密码"><button class=secondary data-action="reset-user-password" data-id="'+u.id+'">重置密码</button></div></div></div>';
+    return '<div class=panel><div class=body stack><div class=row><b>'+esc(u.username)+(u.is_admin?' · 管理员':'')+'</b><span class=pill>ID '+u.id+'</span><span class=pill>邮箱 '+((u.emails||[]).length)+'</span></div><div class=soft>'+rootChecks+'</div><div class=row><button class=secondary onclick="saveUserRoots('+u.id+')">保存目录权限</button>'+deleteBtn+'</div><div class=row><input class=field style="max-width:360px" data-upload-user="'+u.id+'" placeholder="群晖上传目录，留空使用默认" value="'+esc(u.upload_dir||'')+'"><button class=secondary data-action="save-user-upload-dir" data-id="'+u.id+'">保存上传目录</button></div><div class=row><input class=field style="max-width:260px" type=password data-reset-user="'+u.id+'" placeholder="新密码"><button class=secondary data-action="reset-user-password" data-id="'+u.id+'">重置密码</button></div></div></div>';
   }).join('');
   const aa=await api('/api/admin/announcement');
   currentAnnouncement=aa.announcement||currentAnnouncement||{};
   renderAnnouncementAdmin();
+  const site=await api('/api/admin/site').catch(()=>null);
+  if(site?.config){currentConfig={...currentConfig,...site.config};renderSiteConfig()}
+  const mail=await api('/api/admin/mail').catch(()=>null);
+  if(mail?.config)renderMailConfig(mail.config);
   await loadCertificateStatus().catch(()=>{});
   await loadSecurity().catch(()=>{});
 }
@@ -4285,8 +5333,31 @@ function actionText(action){
     clear_logs:'清除日志',
     update_https_certificate:'更新 HTTPS 证书',
     update_login_security:'修改登录风控',
-    remove_login_ban:'解除登录封禁'
+    remove_login_ban:'解除登录封禁',
+    update_site_config:'修改网页访问设置',
+    update_mail_config:'修改邮件配置',
+    send_test_mail:'发送测试邮件',
+    update_email_settings:'修改邮箱通知'
   })[action]||action;
+}
+function parseEmailText(value){return String(value||'').split(/[\n,;]+/).map(x=>x.trim()).filter(Boolean)}
+function renderAccountNotifications(){
+  if(!me||!el.accountEmails)return;
+  el.accountEmails.value=(me.emails||[]).join('\n');
+  el.notifyJobDone.checked=!!me.notify_job_done;
+  el.notifyAdminLogs.checked=!!me.notify_admin_logs;
+}
+async function saveAccountNotifications(){
+  try{
+    const r=await api('/api/account/notifications',{method:'POST',body:JSON.stringify({
+      emails:parseEmailText(el.accountEmails.value),
+      notify_job_done:el.notifyJobDone.checked,
+      notify_admin_logs:el.notifyAdminLogs.checked
+    })});
+    me=r.user||me;
+    renderAccountNotifications();
+    el.accountMailMsg.innerHTML='<div class=ok>邮箱设置已保存</div>';
+  }catch(e){el.accountMailMsg.innerHTML='<div class=error>'+esc(e.message)+'</div>'}
 }
 async function changePassword(){
   try{
@@ -4324,6 +5395,66 @@ function renderSynologyConfig(){
   el.synoStagingDir.value=currentConfig.synology_staging_dir||'';
   el.synoCloudTargetDir.value=currentConfig.synology_cloud_target_dir||'';
   el.synoVerifyTLS.checked=!!currentConfig.verify_tls;
+}
+function renderSiteConfig(){
+  if(!currentConfig||!el.sitePort)return;
+  el.sitePort.value=currentConfig.listen_port||String(currentConfig.listen_addr||':60000').replace(':','')||60000;
+  el.publicBaseURL.value=currentConfig.public_base_url||'';
+}
+async function saveSiteConfig(){
+  try{
+    const res=await api('/api/admin/site',{method:'POST',body:JSON.stringify({
+      listen_addr:':'+Number(el.sitePort.value||60000),
+      public_base_url:el.publicBaseURL.value
+    })});
+    currentConfig={...currentConfig,...res.config};
+    renderSiteConfig();
+    const restart=res.restart_required?'，重启程序或服务后生效':'';
+    el.siteMsg.innerHTML='<div class=ok>访问设置已保存'+restart+'</div>';
+  }catch(e){el.siteMsg.innerHTML='<div class=error>'+esc(e.message)+'</div>'}
+}
+function renderMailConfig(cfg){
+  cfg=cfg||currentConfig||{};
+  if(!el.smtpEnabled)return;
+  el.smtpEnabled.checked=!!cfg.smtp_enabled;
+  el.smtpHost.value=cfg.smtp_host||'';
+  el.smtpPort.value=cfg.smtp_port||587;
+  el.smtpSecure.value=cfg.smtp_secure||'starttls';
+  el.smtpUsername.value=cfg.smtp_username||'';
+  el.smtpPassword.value='';
+  el.smtpFromEmail.value=cfg.smtp_from_email||'';
+  el.smtpFromName.value=cfg.smtp_from_name||'PVE Backup Web';
+  el.mailEventJobNASDone.checked=!!cfg.mail_event_job_nas_done;
+  el.mailEventJobCloudDone.checked=!!cfg.mail_event_job_cloud_done;
+  el.mailEventJobFailed.checked=!!cfg.mail_event_job_failed;
+  el.mailEventLoginBan.checked=!!cfg.mail_event_login_ban;
+}
+async function saveMailConfig(){
+  try{
+    const res=await api('/api/admin/mail',{method:'POST',body:JSON.stringify({
+      smtp_enabled:el.smtpEnabled.checked,
+      smtp_host:el.smtpHost.value,
+      smtp_port:Number(el.smtpPort.value||587),
+      smtp_secure:el.smtpSecure.value,
+      smtp_username:el.smtpUsername.value,
+      smtp_password:el.smtpPassword.value,
+      smtp_from_email:el.smtpFromEmail.value,
+      smtp_from_name:el.smtpFromName.value,
+      mail_event_job_nas_done:el.mailEventJobNASDone.checked,
+      mail_event_job_cloud_done:el.mailEventJobCloudDone.checked,
+      mail_event_job_failed:el.mailEventJobFailed.checked,
+      mail_event_login_ban:el.mailEventLoginBan.checked
+    })});
+    currentConfig={...currentConfig,...res.config};
+    renderMailConfig(res.config);
+    el.mailMsg.innerHTML='<div class=ok>邮件配置已保存</div>';
+  }catch(e){el.mailMsg.innerHTML='<div class=error>'+esc(e.message)+'</div>'}
+}
+async function sendTestMail(){
+  try{
+    const r=await api('/api/admin/mail/test',{method:'POST',body:JSON.stringify({test_to:el.testMailTo.value})});
+    el.mailMsg.innerHTML='<div class=ok>测试邮件已发送，共 '+r.sent+' 个收件人</div>';
+  }catch(e){el.mailMsg.innerHTML='<div class=error>'+esc(e.message)+'</div>'}
 }
 async function saveSynology(){
   try{
