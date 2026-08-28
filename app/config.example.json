@@ -1,0 +1,14 @@
+{
+  "listen_addr": ":60000",
+  "public_base_url": "https://your-server-ip:60000",
+  "synology_base_url": "https://your-nas:5001",
+  "synology_username": "your-synology-user",
+  "synology_password": "",
+  "synology_staging_dir": "/NVME/.pve-backup-incoming",
+  "synology_cloud_target_dir": "/NVME/PVEBackup",
+  "verify_tls": false,
+  "captcha_after_failures": 2,
+  "max_login_failures": 10,
+  "ban_duration_minutes": 0,
+  "permanent_ban": true
+}

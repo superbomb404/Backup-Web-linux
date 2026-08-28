@@ -1,0 +1,37 @@
+# Runtime state and secrets
+config.json
+**/config.json
+state.json
+**/state.json
+state.db
+state.db-*
+**/state.db
+**/state.db-*
+app.key
+**/app.key
+server.crt
+server.key
+**/server.crt
+**/server.key
+bootstrap-admin-password
+**/bootstrap-admin-password
+work/
+**/work/
+
+# Build outputs
+dist/*
+!dist/pve-backup-service.sh
+*.exe
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+
+# Local/editor files
+.env
+*.log
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
